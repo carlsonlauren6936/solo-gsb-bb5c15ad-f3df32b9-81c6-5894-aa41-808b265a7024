@@ -33,8 +33,8 @@ def snapshot():
             "SELECT id, status, scheduled_at, completed_at, batch_id, run_index "
             "FROM jobs ORDER BY id")],
         "tenants": [tuple(r) for r in c.execute(
-            "SELECT id, weight, deficit, max_gpus, aging_settled_at "
-            "FROM tenants ORDER BY id")],
+            "SELECT id, weight, deficit, max_gpus, budget_gpu_min, "
+            "aging_settled_at FROM tenants ORDER BY id")],
         "deps": [tuple(r) for r in c.execute(
             "SELECT job_id, depends_on FROM job_dependencies ORDER BY 1, 2")],
         "batches": c.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"],
@@ -87,12 +87,14 @@ def assert_preview_matches_batch(preview, committed):
     assert [
         (t["id"], t["weight"], t["balance_gpu_min"], t["max_gpus"],
          t["queued_jobs"], t["running_jobs"], t["running_gpus"],
-         t["aging_settled_at"])
+         t["budget_gpu_min"], t["budget_spent_gpu_min"],
+         t["budget_remaining_gpu_min"], t["aging_settled_at"])
         for t in preview["tenants"]
     ] == [
         (t["id"], t["weight"], t["balance_gpu_min"], t["max_gpus"],
          t["queued_jobs"], t["running_jobs"], t["running_gpus"],
-         t["aging_settled_at"])
+         t["budget_gpu_min"], t["budget_spent_gpu_min"],
+         t["budget_remaining_gpu_min"], t["aging_settled_at"])
         for t in committed["tenants"]
     ]
 
@@ -203,6 +205,31 @@ def test_preview_works_with_caps_dependencies_and_full_cluster(conn):
     aging = [e for e in full_preview["events"] if e["kind"] == "AGING"]
     assert aging and all(e["tenant_id"] != "c" for e in aging)
     assert snapshot() == snapshot()  # state stable across the call
+
+
+def test_preview_respects_budget_and_persists_nothing(conn):
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    submit("a", 1, 60, when=iso(0))   # cost 60 -> admitted
+    submit("a", 1, 60, when=iso(1))   # cost 60 -> 120 > 100, budget-blocked
+
+    before = snapshot()
+    preview = scheduler.preview_batch(now=at(10))
+    assert snapshot() == before
+    assert preview["selection_order"] == ["J000001"]
+    tenants = {t["id"]: t for t in preview["tenants"]}
+    assert tenants["a"]["budget_gpu_min"] == 100
+    assert tenants["a"]["budget_spent_gpu_min"] == pytest.approx(60.0)
+    assert tenants["a"]["budget_remaining_gpu_min"] == pytest.approx(40.0)
+
+    committed = scheduler.run_batch(now=at(10))
+    assert_preview_matches_batch(preview, committed)
+
+    # Budget-blocked preview: nothing dispatches, nothing is written.
+    blocked = scheduler.preview_batch(now=at(11))
+    assert blocked["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in blocked["events"])
+    committed2 = scheduler.run_batch(now=at(11))
+    assert_preview_matches_batch(blocked, committed2)
 
 
 def test_preview_empty_queue(conn):

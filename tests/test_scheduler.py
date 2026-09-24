@@ -765,11 +765,205 @@ def test_max_gpus_column_migrated_from_legacy_database(tmp_path, monkeypatch):
         # Existing tenant migrated with an unlimited cap and still works.
         old = scheduler.get_tenant("old")
         assert old["max_gpus"] is None
+        assert old["budget_gpu_min"] is None
+        assert old["budget_remaining_gpu_min"] is None
         r = scheduler.run_batch(now=at(5))
         assert r["selection_order"] == ["J000001"]
         # New tenants can set caps on the migrated schema.
         t = scheduler.upsert_tenant("new", 1.0, max_gpus=2)
         assert t["max_gpus"] == 2
+        # ...and rolling budgets too.
+        t2 = scheduler.upsert_tenant("new2", 1.0, budget_gpu_min=100)
+        assert t2["budget_gpu_min"] == 100
     finally:
         db_mod.reset_for_tests()
         get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Rolling 24-hour GPU-minute budgets
+# ---------------------------------------------------------------------------
+
+def test_budget_defaults_to_unlimited(conn):
+    submit("a", 8, 1000, when=iso(0))
+    scheduler.upsert_tenant("b", 2.0)
+    tenants = {t["id"]: t for t in scheduler.list_tenants()}
+    assert tenants["a"]["budget_gpu_min"] is None
+    assert tenants["a"]["budget_spent_gpu_min"] == 0.0
+    assert tenants["a"]["budget_remaining_gpu_min"] is None
+    assert tenants["b"]["budget_gpu_min"] is None
+    # No budget: a huge job dispatches regardless of cost.
+    assert batch(1)["selection_order"] == ["J000001"]
+
+
+def test_budget_set_clear_omit_preserves(conn):
+    t = scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    assert t["budget_gpu_min"] == 100
+
+    # Omitting the argument preserves the budget (weight update only).
+    t2 = scheduler.upsert_tenant("a", 3.0)
+    assert t2["budget_gpu_min"] == 100 and t2["weight"] == 3.0
+
+    # Explicit None clears the budget.
+    t3 = scheduler.upsert_tenant("a", 3.0, budget_gpu_min=None)
+    assert t3["budget_gpu_min"] is None
+
+    # New tenants are unlimited whether omitted or explicitly null.
+    assert scheduler.upsert_tenant("x", 1.0)["budget_gpu_min"] is None
+    assert scheduler.upsert_tenant("y", 1.0, budget_gpu_min=None)["budget_gpu_min"] is None
+
+
+def test_invalid_budget_rejected(conn):
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, budget_gpu_min=0)
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, budget_gpu_min=-1)
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, budget_gpu_min=2.5)
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, budget_gpu_min=True)
+
+
+def test_budget_blocks_overspend_and_releases_after_window_ages(conn):
+    # Budget 100 GPU-min within any trailing 24h window.
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    submit("a", 1, 60, when=iso(0))    # cost 60 -> fits
+    submit("a", 1, 60, when=iso(1))    # cost 60 -> 120 > 100, blocked
+
+    r = batch(60)
+    assert r["selection_order"] == ["J000001"]
+    a = next(t for t in r["tenants"] if t["id"] == "a")
+    assert a["budget_gpu_min"] == 100
+    assert a["budget_spent_gpu_min"] == pytest.approx(60.0)
+    assert a["budget_remaining_gpu_min"] == pytest.approx(40.0)
+
+    # Budget-blocked head: stays QUEUED and earns no QUANTUM this round
+    # (aging compensation still accrues, exactly as for capacity blocking:
+    # 1 minute of wait at rate 1).
+    before = balances()["a"]
+    r2 = batch(61)
+    assert r2["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in r2["events"])
+    assert balances()["a"] == pytest.approx(before + 1.0)
+    assert [j["id"] for j in scheduler.list_jobs(status="QUEUED")] == ["J000002"]
+
+    # Still inside the trailing 24h after the charge (60 min dispatched at
+    # minute 60; now minute 1499 is just inside 24h): blocked.
+    assert batch(60 + 24 * 60 - 1)["selection_order"] == []
+    # Window end moves strictly past the dispatch instant: (60-1440, 1500],
+    # the charge at minute 60 is now excluded -> J2 dispatches.
+    r3 = batch(60 + 24 * 60)
+    assert r3["selection_order"] == ["J000002"]
+
+
+def test_budget_boundary_is_inclusive_of_now_and_exclusive_of_start(conn):
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=60)
+    submit("a", 1, 60, when=iso(0))
+    batch(0)  # charge 60 lands exactly at window end (now) -> counts.
+    submit("a", 1, 1, when=iso(24 * 60 - 1))
+    # At exactly 24h later the window is (0, 1440]: the prior charge at 0 is
+    # excluded (start-exclusive), so the new cost-1 job fits.
+    r = batch(24 * 60)
+    assert r["selection_order"] == ["J000002"]
+
+
+def test_completion_and_cancellation_never_refund_budget(conn):
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    submit("a", 1, 100, when=iso(0))  # exactly exhausts the budget
+    batch(1)
+    submit("a", 1, 1, when=iso(2))    # no remaining room
+
+    # Completing the charged job does not return budget: still blocked.
+    scheduler.complete_job("J000001")
+    assert batch(3)["selection_order"] == []
+
+    # A RUNNING cancellation does not refund either. Clear the budget so J2
+    # can dispatch, charge it, cancel it, then reinstate a tight budget.
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=None)
+    assert batch(4)["selection_order"] == ["J000002"]
+    scheduler.cancel_job("J000002")
+    # Both dispatches (J1=100 at minute 1, J2=1 at minute 4) remain charged.
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=101)
+    submit("a", 1, 1, when=iso(5))
+    assert batch(6)["selection_order"] == []  # 101 + 1 > 101
+    # Once the window ages past the older charge (J1 at minute 1 is out,
+    # J2 at minute 4 is still in: spent 1), the new job fits (1 + 1 <= 101).
+    r = batch(24 * 60 + 3)  # window (3, 1443]
+    assert r["selection_order"] == ["J000003"]
+
+
+def test_budget_accumulates_earlier_selections_in_same_batch_once(conn):
+    # Budget admits exactly two cost-30 jobs in one batch (60 <= 60); the
+    # third would make it 90 and must wait.
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=60)
+    for m in range(3):
+        submit("a", 1, 30, when=iso(m))
+    r = batch(10)
+    assert r["selection_order"] == ["J000001", "J000002"]
+    a = next(t for t in r["tenants"] if t["id"] == "a")
+    assert a["budget_spent_gpu_min"] == pytest.approx(60.0)
+    assert a["budget_remaining_gpu_min"] == pytest.approx(0.0)
+    # Every selected job is one DISPATCH debit, counted once in the spend.
+    dispatches = [e for e in r["events"] if e["kind"] == "DISPATCH"]
+    assert len(dispatches) == 2
+    # The blocked third job never received a quantum for its blocked round.
+    assert scheduler.list_jobs(status="QUEUED")[0]["id"] == "J000003"
+
+
+def test_budget_block_does_not_starve_other_tenants(conn):
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=10)
+    submit("a", 1, 60, when=iso(0))   # cost 60 > budget 10 -> never this round
+    submit("b", 2, 10, when=iso(1))   # cost 20, b unlimited -> must run
+    r = batch(5)
+    assert r["selection_order"] == ["J000002"]
+    assert all(e["tenant_id"] != "a" or e["kind"] != "QUANTUM"
+               for e in r["events"])
+    assert any(e["tenant_id"] == "b" and e["kind"] == "DISPATCH"
+               for e in r["events"])
+
+
+def test_budget_query_uses_server_utc_now(conn, monkeypatch):
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    submit("a", 1, 60, when=iso(0))
+    batch(0)
+    # A plain tenant query evaluates (server_now-24h, server_now], NOT the
+    # old batch reference instant. With the server clock at minute 5 the
+    # charge at minute 0 is inside the window; at minute 1441 it is not.
+    class FrozenDateTime(scheduler.datetime):
+        frozen = at(5)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.frozen
+
+    monkeypatch.setattr(scheduler, "datetime", FrozenDateTime)
+    t = scheduler.get_tenant("a")
+    assert t["budget_spent_gpu_min"] == pytest.approx(60.0)
+    assert t["budget_remaining_gpu_min"] == pytest.approx(40.0)
+
+    FrozenDateTime.frozen = at(24 * 60 + 1)
+    t = scheduler.get_tenant("a")
+    assert t["budget_spent_gpu_min"] == 0.0
+    assert t["budget_remaining_gpu_min"] == pytest.approx(100.0)
+
+
+def test_budget_shown_in_queue_and_state_snapshots(conn, monkeypatch):
+    scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    submit("a", 1, 60)
+
+    class FrozenDateTime(scheduler.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at(5)
+
+    monkeypatch.setattr(scheduler, "datetime", FrozenDateTime)
+    r = scheduler.run_batch(now=at(5))
+    assert r["selection_order"] == ["J000001"]
+    submit("a", 1, 10)
+    state = scheduler.scheduler_state()
+    a = next(t for t in state["tenants"] if t["id"] == "a")
+    assert a["budget_gpu_min"] == 100
+    assert a["budget_spent_gpu_min"] == pytest.approx(60.0)
+    group = scheduler.queue_overview()["queues"][0]
+    assert group["budget_gpu_min"] == 100
+    assert group["budget_remaining_gpu_min"] == pytest.approx(40.0)

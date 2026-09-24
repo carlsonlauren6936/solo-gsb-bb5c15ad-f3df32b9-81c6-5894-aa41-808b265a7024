@@ -279,9 +279,14 @@ def main() -> int:
     db.reset_for_tests()
     db.connect(legacy)
     assert scheduler.get_tenant("old")["max_gpus"] is None
+    assert scheduler.get_tenant("old")["budget_gpu_min"] is None
     r = scheduler.run_batch(now=at(5))
     assert r["selection_order"] == ["J000001"]
     assert scheduler.upsert_tenant("new", 1.0, max_gpus=4)["max_gpus"] == 4
+    assert (
+        scheduler.upsert_tenant("new2", 1.0, budget_gpu_min=100)["budget_gpu_min"]
+        == 100
+    )
     db.reset_for_tests()
     os.remove(legacy)
     print("case 9 legacy schema migration OK")
@@ -350,6 +355,38 @@ def main() -> int:
         "SELECT COUNT(*) AS n FROM batches").fetchone()["n"] == batches_before
     assert len(scheduler.list_maintenance_windows()) == 3
     print("case 10 maintenance windows admission/preview OK")
+
+    # --- Case 11: rolling 24h GPU-minute budgets ---------------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    # Budget 100 GPU-minutes per trailing 24h window.
+    t = scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    assert t["budget_gpu_min"] == 100 and t["budget_remaining_gpu_min"] == 100
+    submit("a", 1, 60, 1.0, iso(0))   # cost 60 -> fits
+    submit("a", 1, 60, 1.0, iso(1))   # cost 60 -> 120 > 100 -> blocked
+    j3 = submit("b", 2, 10, 1.0, iso(2))  # unlimited tenant unaffected
+    r = scheduler.run_batch(now=at(10))
+    assert r["selection_order"] == ["J000001", j3["id"]], r["selection_order"]
+    a = next(x for x in r["tenants"] if x["id"] == "a")
+    assert abs(a["budget_spent_gpu_min"] - 60.0) < 1e-9
+    assert abs(a["budget_remaining_gpu_min"] - 40.0) < 1e-9
+    # Budget-blocked head earns no quantum; other tenants keep dispatching.
+    blocked = scheduler.run_batch(now=at(11))
+    assert blocked["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in blocked["events"])
+    # Completion never refunds the charge: still blocked minutes later.
+    scheduler.complete_job(j3["id"])
+    scheduler.complete_job("J000001")
+    assert scheduler.run_batch(now=at(20))["selection_order"] == []
+    # Once the 24h window ages past the dispatch (at minute 10), room returns:
+    # (10, 1450] excludes it, so J2 dispatches at minute 1450.
+    r2 = scheduler.run_batch(now=at(10 + 24 * 60))
+    assert r2["selection_order"] == ["J000002"], r2["selection_order"]
+    # Omit keeps the budget; explicit None clears it.
+    assert scheduler.upsert_tenant("a", 2.0)["budget_gpu_min"] == 100
+    assert scheduler.upsert_tenant(
+        "a", 2.0, budget_gpu_min=None)["budget_gpu_min"] is None
+    print("case 11 rolling 24h GPU-minute budget OK")
 
     print("\nALL CORE CHECKS PASSED")
     return 0

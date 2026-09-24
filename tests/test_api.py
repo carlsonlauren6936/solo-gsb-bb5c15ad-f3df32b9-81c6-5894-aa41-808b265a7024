@@ -371,3 +371,78 @@ def test_tenant_cap_validation_http(client):
     # New tenant without the field is unlimited (default behaviour).
     r = client.post("/tenants", json={"tenant_id": "y", "weight": 1})
     assert r.status_code == 201 and r.json()["max_gpus"] is None
+
+
+def test_tenant_budget_flow_via_http(client):
+    # Create a tenant with a rolling 24h budget of 100 GPU-minutes.
+    r = client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "budget_gpu_min": 100})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["budget_gpu_min"] == 100
+    assert body["budget_spent_gpu_min"] == 0.0
+    assert body["budget_remaining_gpu_min"] == 100.0
+
+    # cost 60 -> admitted; cost 60 more would exceed the budget.
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 1, "duration_min": 60}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 1, "duration_min": 60}).json()["id"]
+
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == [j1]
+    tenants = {t["id"]: t for t in body["tenants"]}
+    assert tenants["team-a"]["budget_gpu_min"] == 100
+    assert tenants["team-a"]["budget_spent_gpu_min"] == pytest.approx(
+        60.0, abs=0.01)
+    assert tenants["team-a"]["budget_remaining_gpu_min"] == pytest.approx(
+        40.0, abs=0.01)
+
+    # Budget-blocked head: stays queued, earns no quantum.
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in body["events"])
+
+    # Preview sees the same budget block and writes nothing.
+    body = client.post("/scheduler/preview").json()
+    assert body["preview"] is True and body["selection_order"] == []
+
+    # Completing the charged job does not refund the budget.
+    assert client.post(f"/jobs/{j1}/complete").status_code == 200
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == []
+
+    # Tenant queries report limit and remaining allowance (server UTC clock).
+    t = client.get("/tenants/team-a").json()
+    assert t["budget_gpu_min"] == 100
+    assert t["budget_spent_gpu_min"] == pytest.approx(60.0, abs=0.01)
+    assert t["budget_remaining_gpu_min"] == pytest.approx(40.0, abs=0.01)
+
+    # Clearing the budget (explicit null) unblocks the queued job.
+    r = client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "budget_gpu_min": None})
+    assert r.status_code == 201 and r.json()["budget_gpu_min"] is None
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == [j2]
+
+
+def test_tenant_budget_omitted_preserves_and_validation(client):
+    assert client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1,
+        "budget_gpu_min": 100}).status_code == 201
+    # Update weight without sending budget_gpu_min: budget is preserved.
+    r = client.post("/tenants", json={"tenant_id": "team-a", "weight": 2})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["weight"] == 2.0 and body["budget_gpu_min"] == 100
+
+    # budget_gpu_min must be a positive integer.
+    for bad in (0, -2, True):
+        r = client.post("/tenants", json={
+            "tenant_id": "x", "weight": 1, "budget_gpu_min": bad})
+        assert r.status_code == 422
+    # New tenant without the field is unlimited.
+    r = client.post("/tenants", json={"tenant_id": "y", "weight": 1})
+    assert r.status_code == 201
+    assert r.json()["budget_gpu_min"] is None
+    assert r.json()["budget_remaining_gpu_min"] is None

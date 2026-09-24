@@ -64,6 +64,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             -- Optional per-tenant cap on concurrently allocated GPUs;
             -- NULL means unlimited (only cluster capacity constrains it).
             max_gpus         INTEGER,
+            -- Optional rolling 24-hour GPU-minute budget; NULL means
+            -- unlimited. Charged at dispatch time (gpus * duration_min);
+            -- completion/cancellation never refunds.
+            budget_gpu_min   INTEGER,
             -- Wall-clock time up to which aging has already been compensated.
             aging_settled_at TEXT,
             created_at       TEXT NOT NULL,
@@ -151,3 +155,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     }
     if "max_gpus" not in tenant_cols:
         conn.execute("ALTER TABLE tenants ADD COLUMN max_gpus INTEGER")
+    # Same story for the rolling 24-hour GPU-minute budget: databases from
+    # before budgets existed get the nullable column, pre-existing tenants
+    # stay unlimited.
+    if "budget_gpu_min" not in tenant_cols:
+        conn.execute("ALTER TABLE tenants ADD COLUMN budget_gpu_min INTEGER")

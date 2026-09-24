@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from . import db, scheduler
 from .config import get_settings
@@ -59,14 +59,29 @@ class TenantIn(BaseModel):
         ),
         examples=[4],
     )
+    budget_gpu_min: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional rolling 24-hour GPU-minute budget: the tenant may not "
+            "dispatch more than this many gpus*duration_min in the trailing "
+            "24h window of a batch. Provide a positive integer to set/update "
+            "the budget; send null explicitly to clear it (unlimited). Omit "
+            "the field entirely to leave an existing tenant's budget "
+            "unchanged (new tenants get unlimited). Note: the field must be "
+            "omitted, not null, to preserve a budget. Charges are never "
+            "refunded on completion or cancellation."
+        ),
+        examples=[1000],
+    )
 
-    @field_validator("max_gpus", mode="before")
+    @field_validator("max_gpus", "budget_gpu_min", mode="before")
     @classmethod
-    def _reject_bool_for_int(cls, value):
+    def _reject_bool_for_int(cls, value, info: ValidationInfo):
         # Run before Pydantic's bool->int coercion, since JSON booleans must
-        # not be accepted as an integer GPU cap.
+        # not be accepted as an integer GPU cap / GPU-minute budget.
         if isinstance(value, bool):
-            raise ValueError("max_gpus must be a positive integer or null")
+            raise ValueError(f"{info.field_name} must be a positive integer or null")
         return value
 
 
@@ -161,18 +176,19 @@ class MaintenanceWindowIn(BaseModel):
 
 @app.post("/tenants", tags=["tenants"], status_code=201)
 def create_or_update_tenant(body: TenantIn):
-    # Distinguish "field omitted" (preserve existing cap) from an explicit
-    # JSON null (clear the cap).
+    # Distinguish "field omitted" (preserve existing value) from an explicit
+    # JSON null (clear it) for both optional tenant limits.
+    kwargs = {}
     if "max_gpus" in body.model_fields_set:
-        return scheduler.upsert_tenant(
-            body.tenant_id, body.weight, max_gpus=body.max_gpus
-        )
-    return scheduler.upsert_tenant(body.tenant_id, body.weight)
+        kwargs["max_gpus"] = body.max_gpus
+    if "budget_gpu_min" in body.model_fields_set:
+        kwargs["budget_gpu_min"] = body.budget_gpu_min
+    return scheduler.upsert_tenant(body.tenant_id, body.weight, **kwargs)
 
 
 @app.get("/tenants", tags=["tenants"])
 def get_tenants():
-    """All tenants with weights and current GPU-minute balances."""
+    """All tenants with weights, balances, GPU caps and 24h budget usage."""
     return scheduler.list_tenants()
 
 
