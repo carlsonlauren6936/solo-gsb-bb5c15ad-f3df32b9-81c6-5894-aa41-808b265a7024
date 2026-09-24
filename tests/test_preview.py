@@ -33,8 +33,8 @@ def snapshot():
             "SELECT id, status, scheduled_at, completed_at, batch_id, run_index "
             "FROM jobs ORDER BY id")],
         "tenants": [tuple(r) for r in c.execute(
-            "SELECT id, weight, deficit, max_gpus, aging_settled_at "
-            "FROM tenants ORDER BY id")],
+            "SELECT id, weight, deficit, max_gpus, budget_gpu_min, "
+            "aging_settled_at FROM tenants ORDER BY id")],
         "deps": [tuple(r) for r in c.execute(
             "SELECT job_id, depends_on FROM job_dependencies ORDER BY 1, 2")],
         "batches": c.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"],
@@ -86,11 +86,15 @@ def assert_preview_matches_batch(preview, committed):
     ]
     assert [
         (t["id"], t["weight"], t["balance_gpu_min"], t["max_gpus"],
+         t["budget_gpu_min"], t["budget_used_gpu_min"],
+         t["budget_remaining_gpu_min"], t["budget_window_end_at"],
          t["queued_jobs"], t["running_jobs"], t["running_gpus"],
          t["aging_settled_at"])
         for t in preview["tenants"]
     ] == [
         (t["id"], t["weight"], t["balance_gpu_min"], t["max_gpus"],
+         t["budget_gpu_min"], t["budget_used_gpu_min"],
+         t["budget_remaining_gpu_min"], t["budget_window_end_at"],
          t["queued_jobs"], t["running_jobs"], t["running_gpus"],
          t["aging_settled_at"])
         for t in committed["tenants"]

@@ -56,14 +56,18 @@ cost_gpu_min = gpus × duration_min        # GPU-分钟
 ### 加权 DRR（每次 `POST /scheduler/batch`）
 
 1. 取所有含 QUEUED 作业的租户，按**租户 id 升序**固定排列。
-2. 每个 DRR 轮次，每位“队首作业**同时**能放入当前空闲 GPU、且未超过本租户并发
-   GPU 上限（见下节）”的租户获得 `BASE_QUANTUM_GPU_MIN × weight` 的 QUANTUM 信用。
+2. 每个 DRR 轮次，每位“队首作业**同时**能放入当前空闲 GPU、未超过本租户并发
+   GPU 上限、且加入其成本后不超过本租户滚动 24 小时 GPU-分钟预算（见下两节）”
+   的租户获得 `BASE_QUANTUM_GPU_MIN × weight` 的 QUANTUM 信用。
 3. 按固定顺序访问租户：当 `余额 ≥ 队首作业成本` **且** `空闲 GPU ≥ 作业 GPU 数`
-   **且** `租户 RUNNING 占用 GPU + 作业 GPU 数 ≤ 租户上限` 时，派发该作业并扣减余额；否则继续。
-4. **容量永远不越界**：放不下的作业——无论是受**集群容量**还是受**租户上限**
-   阻塞（已有运行作业占满上限，或队首作业自身超过上限）——本轮不获得任何
+   **且** `租户 RUNNING 占用 GPU + 作业 GPU 数 ≤ 租户上限`
+   **且** `窗口内已派发成本 + 本批前序成本 + 作业成本 ≤ 租户预算`
+   时，派发该作业并扣减余额；否则继续。
+4. **容量永远不越界**：放不下的作业——无论是受**集群容量**、**租户上限**还是
+   **滚动 24h 预算**阻塞（已有运行作业占满上限、队首作业自身超过上限、或窗口内
+   预算额度不足）——本轮不获得任何
    QUANTUM——等待释放由老化补偿，也避免重复调用接口“刷”余额。各租户的资格彼此
-   独立：被上限阻塞的租户被跳过，**其他符合条件的租户本轮照常调度**。
+   独立：被阻塞的租户被跳过，**其他符合条件的租户本轮照常调度**。
 5. “放得下但暂时买不起”的租户可在**同一批次内连续多轮累积**直到买得起；
    批次结束时未促成任何派发的尾部授权自动回滚，保证空转调用不改变余额。
 
@@ -90,6 +94,49 @@ cost_gpu_min = gpus × duration_min        # GPU-分钟
 - 租户对象（`GET /tenants`、`GET /scheduler/state`、批次结果等）含
   `max_gpus`（上限，`null` 为不限）与 `running_gpus`（当前 RUNNING 作业占用 GPU
   数，即上限已用量）。
+
+### 租户滚动 24 小时 GPU-分钟预算（可选 `budget_gpu_min`）
+
+每个租户还可设置一个**滚动 24 小时 GPU-分钟预算**（正整数，单位与作业成本相同）；
+`null`（或旧租户未设置）表示**不限额**：
+
+- 批次以其参考时刻 `now` 为窗口终点，统计半开区间 **`(now − 24 小时, now]`**
+  内该租户**已派发作业**的 `gpus × duration_min` 累计值（左开：恰好在
+  `now − 24h` 派发的作业不计入；右闭：在 `now` 当刻派发的计入）。
+- 派发候选作业前，准入条件在集群容量、维护时段与 `max_gpus` 之外再增加：
+
+  ```
+  窗口内历史已派发成本 + 本批次前序已选中作业成本 + 候选成本
+      ≤ budget_gpu_min
+  ```
+
+  本批次前序选中的作业 `scheduled_at` 就是 `now`（落在窗口内），由同一个累计
+  计数**只计一次**，不会重复扣减。
+- 候选成本加入后**超额**时：该作业**保持 QUEUED**，且与容量/上限阻塞一样
+  **本轮不获得 QUANTUM**（无法刷信用，老化补偿照常）；该租户被跳过，
+  **其他租户本轮继续独立调度**。严格 FIFO 不变：被预算挡住的队首作业不跳过，
+  其后即使有小额可负担作业也继续等待。
+- 成本在**派发时一次性计入**；作业随后 `complete` 或（RUNNING 中）`cancel`
+  **均不退还**。只有从未派发（一直 QUEUED，含排队中取消）的作业不计费。
+- 随着时间推移，超过 24 小时的旧派发自动滑出窗口，剩余额度随之恢复。
+- 通过 `POST /tenants` **设置 / 更新 / 清除**，约定与 `max_gpus` 完全一致：
+  - 请求体带 `"budget_gpu_min": 1440` → 设置/更新；
+  - 显式 `"budget_gpu_min": null` → 清除（恢复不限额）；
+  - **完全省略**该字段 → 保留既有预算不变；新租户省略时默认不限额。
+  - 0/负数/小数/布尔 → 422（服务层直接调用返回 400）。
+- `POST /jobs` 自动注册租户**不会**改动既有预算；预算**持久化在 SQLite** 的
+  `tenants.budget_gpu_min` 列；对没有该列的旧数据库，启动时自动
+  `ALTER TABLE ADD COLUMN` 补列，旧租户为 `NULL`（不限额）。
+- 租户查询（`GET /tenants`、`GET /tenants/{id}`、`GET /scheduler/state`）以
+  **服务器当前 UTC 时刻**为窗口终点返回：
+  - `budget_gpu_min`：预算上限（`null` = 不限额）；
+  - `budget_used_gpu_min`：当前 24 小时窗口内已用 GPU-分钟；
+  - `budget_remaining_gpu_min`：窗口内剩余额度（不限额时为 `null`）；
+  - `budget_window_start_at` / `budget_window_end_at`：上述数值实际对应的
+    `(now−24h, now]` 窗口端点（UTC）。批次结果中的同名字段以**该批次参考时刻**
+    为窗口终点，与该批的决策严格自洽；`GET /queue` 的每租户分组也带这些字段。
+- **预演 `/scheduler/preview` 与正式批次共用同一派发代码路径**：预算判定完全
+  相同，但预演事务回滚，候选成本不落库、不产生任何计费记录，可任意重复调用。
 
 ### 老化补偿（防饥饿）
 
@@ -180,7 +227,8 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
 
 提交作业时若 `gpus > CLUSTER_GPUS`（永远无法运行）会被拒绝（400）。
 
-> 注意：租户上限 `max_gpus` **不是**环境变量，而是通过接口逐租户设置并持久化在
+> 注意：租户的并发 GPU 上限 `max_gpus` 与滚动 24 小时 GPU-分钟预算
+> `budget_gpu_min` **都不是**环境变量，而是通过接口逐租户设置并持久化在
 > SQLite 中；环境变量只配置上面这些全局参数。
 
 ---
@@ -189,23 +237,23 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
 
 基础地址：`http://localhost:8000`
 
-### 0. 管理租户（权重与并发 GPU 上限）`POST /tenants`
+### 0. 管理租户（权重、并发 GPU 上限与 24 小时 GPU-分钟预算）`POST /tenants`
 
 ```bash
-# 创建租户：权重 2，并发 GPU 上限 4
+# 创建租户：权重 2，并发 GPU 上限 4，滚动 24h GPU-分钟预算 1440
 curl -X POST http://localhost:8000/tenants \
   -H 'Content-Type: application/json' \
-  -d '{"tenant_id":"team-a","weight":2.0,"max_gpus":4}'
+  -d '{"tenant_id":"team-a","weight":2.0,"max_gpus":4,"budget_gpu_min":1440}'
 
-# 更新权重但保留原上限（省略 max_gpus 字段）
+# 更新权重但保留原上限与预算（省略两个可选字段）
 curl -X POST http://localhost:8000/tenants \
   -H 'Content-Type: application/json' \
   -d '{"tenant_id":"team-a","weight":1.5}'
 
-# 清除上限（显式 null => 恢复不限额）
+# 清除预算（显式 null => 恢复不限额）；未提供的 max_gpus 同理会保留
 curl -X POST http://localhost:8000/tenants \
   -H 'Content-Type: application/json' \
-  -d '{"tenant_id":"team-a","weight":1.5,"max_gpus":null}'
+  -d '{"tenant_id":"team-a","weight":1.5,"budget_gpu_min":null}'
 ```
 
 | 字段 | 必填 | 说明 |
@@ -213,18 +261,25 @@ curl -X POST http://localhost:8000/tenants \
 | `tenant_id` | 是 | 非空租户标识 |
 | `weight` | 是 | 租户权重，必须 > 0 |
 | `max_gpus` | 否 | 并发 GPU 上限，正整数；显式 `null` 清除上限；**省略**时保留既有上限（新租户为不限额 `null`）。0/负数 → 422 |
+| `budget_gpu_min` | 否 | **滚动 24 小时 GPU-分钟预算**，正整数；显式 `null` 清除（不限额）；**省略**时保留既有预算（新租户为不限额 `null`）。0/负数/小数/布尔 → 422 |
 
 响应为租户对象，除权重/余额外还包含：
 
 - `max_gpus`：并发 GPU 上限（`null` = 不限额）；
 - `running_gpus`：该租户当前 RUNNING 作业合计占用的 GPU 数（上限已用量）；
+- `budget_gpu_min`：滚动 24h GPU-分钟预算上限（`null` = 不限额）；
+- `budget_used_gpu_min`：以**服务器当前 UTC 时刻**为终点的 `(now−24h, now]`
+  窗口内已派发作业成本合计（完成/取消不退还）；
+- `budget_remaining_gpu_min`：同一窗口内剩余可派发额度（不限额时为 `null`）；
+- `budget_window_start_at` / `budget_window_end_at`：上述窗口的 UTC 起止端点；
 - `queued_jobs` / `running_jobs`：队列中 / 运行中的作业数。
 
 ### 1. 提交作业 `POST /jobs`
 
-提交作业时租户会被自动注册（也可用 `POST /tenants` 单独管理权重与 `max_gpus`）。
-同一租户重复提交可更新其权重，但**不会**改动该租户已设置的 `max_gpus` 上限
-（自动注册的新租户上限为 `null`，即不限额）。
+提交作业时租户会被自动注册（也可用 `POST /tenants` 单独管理权重、`max_gpus`
+与 `budget_gpu_min`）。同一租户重复提交可更新其权重，但**不会**改动该租户已
+设置的 `max_gpus` 上限或 `budget_gpu_min` 预算（自动注册的新租户二者均为
+`null`，即不限额/不限预算）。
 
 ```bash
 curl -X POST http://localhost:8000/jobs \
@@ -256,7 +311,8 @@ curl -X POST http://localhost:8000/jobs \
 
 ### 2. 调度下一批 `POST /scheduler/batch`
 
-执行一次 WDRR + 老化批次（**会落库**：作业转 RUNNING、扣减余额、写账本与批次），
+执行一次 WDRR + 老化批次（**会落库**：作业转 RUNNING、扣减余额、写账本与批次、
+按 `scheduled_at = now` 计入租户滚动 24h GPU-分钟预算），
 返回**选择顺序**、每租户**余额**、容量使用与完整事件流水：
 
 ```bash
@@ -377,7 +433,12 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
   "queued_jobs": 1, "running_jobs": 1,
   "queues": [{
     "tenant_id": "team-c", "weight": 1.0, "balance_gpu_min": 12.5,
-    "max_gpus": null, "running_gpus": 0,
+    "max_gpus": null,
+    "budget_gpu_min": null, "budget_used_gpu_min": 0,
+    "budget_remaining_gpu_min": null,
+    "budget_window_start_at": "2026-09-21T10:00:00+00:00",
+    "budget_window_end_at": "2026-09-22T10:00:00+00:00",
+    "running_gpus": 0,
     "oldest_queued_at": "2026-09-22T10:00:00+00:00",
     "jobs": [{
       "id": "J000005", "position": 1, "gpus": 4, "status": "QUEUED",
@@ -492,7 +553,7 @@ curl -s -X POST localhost:8000/scheduler/batch \
 | GET | `/jobs/{id}` | 作业详情 |
 | POST | `/jobs/{id}/cancel` | 取消作业 |
 | POST | `/jobs/{id}/complete` | 完成运行中作业并释放 GPU |
-| POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限 |
+| POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限，可选 `budget_gpu_min` 设置/更新/清除滚动 24h GPU-分钟预算（省略保留、null 清除） |
 | GET | `/tenants` / `/tenants/{id}` | 租户与余额 |
 | POST | `/scheduler/batch` | **调度下一批（落库）**，返回选择顺序与余额；可选请求体 `{"now": <UTC ISO-8601>}` 指定参考时刻 |
 | POST | `/scheduler/preview` | **预演下一批（零写入，事务回滚）**：与 batch 同一套 WDRR/老化/上限/依赖判定，返回预测的派发顺序、批次后 GPU 占用、租户余额与信用事件；可选 `{"now": ...}` |
@@ -546,6 +607,20 @@ curl -s localhost:8000/tenants/team-c                      # max_gpus=2, running
 # 完成后释放额度，下一批次派发第二个；也可再次 POST /tenants 调高或清除上限
 curl -s -X POST localhost:8000/scheduler/batch        # => [J000004]
 
+# 租户滚动 24 小时 GPU-分钟预算：team-d 预算 100 GPU-分钟；
+# 1 GPU × 60 min 的作业可派发，再来一个同成本作业（累计 120 > 100）排队等待，
+# 但其他租户不受影响；完成/取消不退还，24 小时后旧派发滑出窗口额度恢复
+curl -s -X POST localhost:8000/tenants -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-d","weight":1,"budget_gpu_min":100}'
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-d","gpus":1,"duration_min":60}'
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-d","gpus":1,"duration_min":60}'
+curl -s -X POST localhost:8000/scheduler/batch        # => [J....] 只派发第一个
+curl -s localhost:8000/tenants/team-d
+# {"budget_gpu_min":100,"budget_used_gpu_min":60,"budget_remaining_gpu_min":40,
+#  "budget_window_start_at":"...(now-24h)...","budget_window_end_at":"...now(UTC)..."}
+
 # 按 UTC 时间窗汇总实际 GPU 用量（已结束作业取 scheduled_at→completed_at，
 # 仍 RUNNING 的作业截断到 end；QUEUED 不计；左闭右开）
 curl -s -G localhost:8000/usage/gpu \
@@ -570,8 +645,8 @@ curl -s -G localhost:8000/maintenance-windows \
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（82 个：服务层算法/依赖/用量汇总/租户 GPU 上限/批次预演/
-# GPU 维护时段 + HTTP 端到端）
+# 运行全部测试（100 个：服务层算法/依赖/用量汇总/租户 GPU 上限/滚动 24h
+# GPU-分钟预算/批次预演/GPU 维护时段 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
@@ -586,13 +661,14 @@ CLUSTER_GPUS=8 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py       # 环境变量配置
-  db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger/job_dependencies/maintenance_windows）
-  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段准入，框架无关）
+  db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger/job_dependencies/maintenance_windows，含旧库补列迁移）
+  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段 + 租户上限/24h 预算准入，框架无关）
   main.py         # FastAPI 路由与请求模型
 scripts/
   verify_core.py  # 零依赖核心算法验证
 tests/
   test_scheduler.py    # 算法测试（注入时间，确定性断言）
+  test_budget.py       # 滚动 24h GPU-分钟预算：设置/保留/清除、超额阻塞、窗口滑动、不退费、预演不落库
   test_preview.py      # 预演测试：与正式批次决策一致、零写入、异常回滚
   test_maintenance.py  # 维护时段：持久化/校验、重叠准入、端点相接、RUNNING 不抢占、预演一致
   test_api.py          # HTTP 端到端测试

@@ -37,6 +37,37 @@ ones, bounding starvation. Completing or cancelling a RUNNING job releases
 the GPUs against the cap immediately. Caps are set/cleared through
 ``POST /tenants``; submitting a job never changes an existing cap.
 
+Rolling 24-hour GPU-minute budgets
+==================================
+A tenant may additionally carry an optional ``budget_gpu_min``: a positive
+integer cap on the total job cost (``gpus * duration_min``) of jobs **dispatched**
+inside the rolling 24-hour window ending at the batch reference instant, i.e.
+the half-open-on-the-left interval ``(now - 24h, now]`` (NULL = unlimited, the
+default for old and auto-registered tenants). Every dispatched job's full
+estimated cost is charged exactly once at dispatch, keyed by ``scheduled_at``;
+completing or cancelling a job never refunds the charge, so the spent amount is
+the sum over the tenant's jobs (COMPLETED, still RUNNING or cancelled after
+dispatch) whose dispatch instant lies inside the window. Jobs that remain
+QUEUED — including budget-blocked ones — spend nothing.
+
+Before each candidate dispatch in a batch the scheduler adds the candidate's
+cost to (a) the cost of earlier batches' jobs dispatched inside ``(now-24h, now]``
+and (b) the cost of jobs selected earlier in *this* batch (those became RUNNING
+with ``scheduled_at = now`` and are therefore already inside the window, so they
+are counted once through the same running total). A candidate that would exceed
+the budget stays QUEUED and — exactly like a cap- or capacity-blocked head —
+receives no QUANTUM for that round (the endpoint cannot be farmed), while every
+other tenant is evaluated independently and keeps dispatching. The same code
+path runs in a preview, whose rollback also discards the prospective charges;
+nothing about a budget is written outside a committed batch.
+
+``GET /tenants`` / ``GET /tenants/{id}`` report the cap as ``budget_gpu_min``
+together with the ``budget_used_gpu_min`` and ``budget_remaining_gpu_min``
+(``null`` when uncapped) evaluated at the server's current UTC instant, so the
+rolling window is always measured live. Budgets are set/cleared through
+``POST /tenants`` with the same omit/preserve vs explicit ``null``/clear
+convention as ``max_gpus``; submitting a job never changes an existing budget.
+
 Aging compensation
 ==================
 While a tenant has a queued job, elapsed wall-clock time since its last
@@ -296,13 +327,15 @@ def upsert_tenant(
     tenant_id: str,
     weight: float,
     max_gpus: int | None | object = UNSET,
+    budget_gpu_min: int | None | object = UNSET,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Create a tenant or update its weight (and optionally its GPU cap).
+    """Create a tenant or update its weight (and optionally its cap/budget).
 
     Existing balances are retained. ``max_gpus`` accepts a positive integer to
-    set the cap, ``None`` to clear it, or may be omitted to leave an existing
-    tenant's cap untouched.
+    set the concurrent-GPU cap, ``None`` to clear it, or may be omitted to
+    leave an existing tenant's cap untouched. ``budget_gpu_min`` follows the
+    exact same convention for the rolling 24-hour GPU-minute budget.
     """
     if not tenant_id or not tenant_id.strip():
         raise SchedulerError("tenant_id must be a non-empty string")
@@ -316,6 +349,15 @@ def upsert_tenant(
             or max_gpus <= 0
         ):
             raise SchedulerError("max_gpus must be a positive integer or null")
+    if budget_gpu_min is not UNSET:
+        if budget_gpu_min is not None and (
+            not isinstance(budget_gpu_min, int)
+            or isinstance(budget_gpu_min, bool)
+            or budget_gpu_min <= 0
+        ):
+            raise SchedulerError(
+                "budget_gpu_min must be a positive integer or null"
+            )
     settings = settings or get_settings()
     now = _now_iso()
     with db.get_lock(), db.get_conn():
@@ -327,13 +369,14 @@ def upsert_tenant(
         if existing is None:
             conn.execute(
                 """INSERT INTO tenants
-                       (id, weight, deficit, max_gpus, aging_settled_at,
-                        created_at, updated_at)
-                   VALUES (?, ?, 0, ?, NULL, ?, ?)""",
+                       (id, weight, deficit, max_gpus, budget_gpu_min,
+                        aging_settled_at, created_at, updated_at)
+                   VALUES (?, ?, 0, ?, ?, NULL, ?, ?)""",
                 (
                     tenant_id,
                     float(weight),
                     (None if max_gpus is UNSET else max_gpus),
+                    (None if budget_gpu_min is UNSET else budget_gpu_min),
                     now,
                     now,
                 ),
@@ -347,6 +390,11 @@ def upsert_tenant(
                 conn.execute(
                     "UPDATE tenants SET max_gpus = ? WHERE id = ?",
                     (max_gpus, tenant_id),
+                )
+            if budget_gpu_min is not UNSET:
+                conn.execute(
+                    "UPDATE tenants SET budget_gpu_min = ? WHERE id = ?",
+                    (budget_gpu_min, tenant_id),
                 )
         return get_tenant(tenant_id)
 
@@ -363,7 +411,8 @@ def get_tenant(tenant_id: str) -> dict[str, Any]:
 
 
 _TENANT_SELECT = """
-    SELECT t.id, t.weight, t.deficit, t.max_gpus, t.aging_settled_at,
+    SELECT t.id, t.weight, t.deficit, t.max_gpus, t.budget_gpu_min,
+           t.aging_settled_at,
            SUM(CASE WHEN j.status = 'QUEUED'   THEN 1 ELSE 0 END) AS queued,
            SUM(CASE WHEN j.status = 'RUNNING'  THEN 1 ELSE 0 END) AS running,
            COALESCE(SUM(CASE WHEN j.status = 'RUNNING'
@@ -373,14 +422,96 @@ _TENANT_SELECT = """
      GROUP BY t.id
 """
 
+# Half-open-on-the-left rolling window: strictly later than window_start
+# (now - 24h) and at or before window_end (now). Only jobs that were actually
+# dispatched have a scheduled_at; each is charged its full estimated cost
+# exactly once, and completion/cancellation never refunds it, so the charge
+# survives whatever the job's later status is.
+_BUDGET_SPENT_SELECT = """
+    SELECT tenant_id,
+           COALESCE(SUM(gpus * duration_min), 0) AS spent
+      FROM jobs
+     WHERE scheduled_at IS NOT NULL
+       AND scheduled_at > ?
+       AND scheduled_at <= ?
+       AND tenant_id IS ?
+     GROUP BY tenant_id
+"""
 
-def _tenant_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _budget_window_end(window_end: datetime | None) -> datetime:
+    """Default a budget query's window end to the server's current UTC instant."""
+    return _as_utc(window_end) if window_end is not None else _now_utc()
+
+
+def _budget_spent_map(
+    conn: sqlite3.Connection,
+    window_end: datetime,
+) -> dict[str, int]:
+    """GPU-minutes charged per tenant over ``(window_end - 24h, window_end]``.
+
+    Charges are ``gpus * duration_min`` of dispatched jobs (any non-QUEUED
+    status: RUNNING, COMPLETED, or CANCELLED after dispatch) keyed by
+    ``scheduled_at``. Timestamps are normalised UTC ISO-8601, so the
+    half-open window compares lexicographically.
+    """
+    end = _as_utc(window_end)
+    start = end - timedelta(hours=24)
+    rows = conn.execute(
+        _BUDGET_SPENT_SELECT.replace(" AND tenant_id IS ?", ""),
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    return {r["tenant_id"]: int(r["spent"]) for r in rows}
+
+
+def _budget_spent_for(
+    conn: sqlite3.Connection,
+    tenant_id: str,
+    window_end: datetime,
+) -> int:
+    end = _as_utc(window_end)
+    start = end - timedelta(hours=24)
+    row = conn.execute(
+        _BUDGET_SPENT_SELECT,
+        (start.isoformat(), end.isoformat(), tenant_id),
+    ).fetchone()
+    return int(row["spent"]) if row is not None else 0
+
+
+def _tenant_dict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    window_end: datetime | None = None,
+    spent: int | None = None,
+) -> dict[str, Any]:
+    # Budget queries default to the server's current UTC instant; batch
+    # snapshots pass the batch reference instant so the snapshot is
+    # self-consistent with its selection decision.
+    end = _budget_window_end(window_end)
+    if spent is None:
+        spent = _budget_spent_for(conn, row["id"], end)
+    budget = row["budget_gpu_min"]
     return {
         "id": row["id"],
         "weight": round(row["weight"], 6),
         "balance_gpu_min": round(row["deficit"], 6),
         # Optional concurrent-GPU cap; None means unlimited.
         "max_gpus": row["max_gpus"],
+        # Optional rolling 24h GPU-minute budget cap; None means unlimited.
+        "budget_gpu_min": budget,
+        # Cost already charged for dispatches in (now-24h, now].
+        "budget_used_gpu_min": spent,
+        # Headroom left in the same window; null when the tenant is uncapped.
+        "budget_remaining_gpu_min": (
+            None if budget is None else max(budget - spent, 0)
+        ),
+        # Window the two figures above were evaluated against.
+        "budget_window_start_at": (end - timedelta(hours=24)).isoformat(),
+        "budget_window_end_at": end.isoformat(),
         "queued_jobs": row["queued"],
         "running_jobs": row["running"],
         # GPUs currently held by the tenant's RUNNING jobs (cap usage).
@@ -389,9 +520,15 @@ def _tenant_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _list_tenants(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def _list_tenants(
+    conn: sqlite3.Connection,
+    window_end: datetime | None = None,
+) -> list[dict[str, Any]]:
+    end = _budget_window_end(window_end)
     rows = conn.execute(_TENANT_SELECT + " ORDER BY t.id").fetchall()
-    return [_tenant_dict(conn, r) for r in rows]
+    spent_map = _budget_spent_map(conn, end)
+    return [_tenant_dict(conn, r, end, spent_map.get(r["id"], 0))
+            for r in rows]
 
 
 def list_tenants() -> list[dict[str, Any]]:
@@ -834,7 +971,7 @@ def _batch_tx_body(
 
     active = conn.execute(
         """SELECT DISTINCT j.tenant_id, t.weight, t.deficit,
-                          t.max_gpus, t.aging_settled_at
+                          t.max_gpus, t.budget_gpu_min, t.aging_settled_at
              FROM jobs j JOIN tenants t ON t.id = j.tenant_id
             WHERE j.status = ?
             ORDER BY j.tenant_id""",
@@ -879,6 +1016,19 @@ def _batch_tx_body(
     caps: dict[str, int | None] = {
         t["tenant_id"]: t["max_gpus"] for t in active
     }
+
+    # Rolling 24h GPU-minute budgets (NULL = unlimited). ``budget_spent`` is
+    # the cost charged by earlier committed batches for jobs dispatched inside
+    # (now-24h, now]; it is loaded once per batch and never changes during the
+    # loop. ``selected_cost`` accumulates the cost of jobs selected earlier in
+    # THIS batch: their scheduled_at is ``now`` (inside the window), and since
+    # they are no longer QUEUED they never reappear in ``budget_spent``'s query,
+    # so the running total counts each of them exactly once.
+    budgets: dict[str, int | None] = {
+        t["tenant_id"]: t["budget_gpu_min"] for t in active
+    }
+    budget_spent: dict[str, int] = _budget_spent_map(conn, now_dt)
+    selected_cost: dict[str, int] = {}
     tenant_running: dict[str, int] = {}
 
     def running_gpus(tenant_id: str) -> int:
@@ -901,8 +1051,8 @@ def _batch_tx_body(
 
     def tenant_can_fit(tenant_id: str, head, head_gpus: int, free_gpus: int) -> bool:
         """Head job must fit the cluster capacity left over after the peak
-        maintenance reservation over its predicted run, and the tenant's own
-        concurrent-GPU cap.
+        maintenance reservation over its predicted run, the tenant's own
+        concurrent-GPU cap, and the tenant's rolling 24h GPU-minute budget.
 
         The cluster test accounts for every allocation held throughout the
         candidate's run: pre-existing RUNNING jobs (``used``), jobs already
@@ -918,6 +1068,12 @@ def _batch_tx_body(
         cap = caps.get(tenant_id)
         if cap is not None and tenant_running[tenant_id] + head_gpus > cap:
             return False
+        budget = budgets.get(tenant_id)
+        if budget is not None:
+            candidate_cost = int(head["gpus"]) * int(head["duration_min"])
+            if budget_spent.get(tenant_id, 0) \
+                    + selected_cost.get(tenant_id, 0) + candidate_cost > budget:
+                return False
         return True
 
     # Aging is settled even when the cluster is full, so waiting tenants
@@ -1073,6 +1229,13 @@ def _batch_tx_body(
             free -= head["gpus"]
             selected_gpus += head["gpus"]
             tenant_running[tenant_id] += head["gpus"]
+            # Charge the 24h rolling budget once, at dispatch; completion and
+            # cancellation never refund it. In a preview this whole
+            # transaction rolls back, so the charge never reaches the DB.
+            selected_cost[tenant_id] = (
+                selected_cost.get(tenant_id, 0)
+                + int(head["gpus"]) * int(head["duration_min"])
+            )
             dispatched_this_round = True
 
         if dispatched_this_round:
@@ -1170,7 +1333,9 @@ def _batch_result(
         "jobs_selected": len(jobs),
         "selection_order": [j["id"] for j in jobs],
         "selected_jobs": [annotated_job(j) for j in jobs],
-        "tenants": _list_tenants(conn),
+        # Tenant budget figures are evaluated at this batch's reference
+        # instant, so they match the very window the decision was made on.
+        "tenants": _list_tenants(conn, window_end=now_dt),
         "events": _list_ledger(conn, batch_id=batch_id),
     }
 
@@ -1318,6 +1483,8 @@ def queue_overview() -> dict[str, Any]:
         tenants = conn.execute(
             _TENANT_SELECT + " ORDER BY t.id"
         ).fetchall()
+        now_dt = _now_utc()
+        spent_map = _budget_spent_map(conn, now_dt)
         groups = []
         for t in tenants:
             queued = conn.execute(
@@ -1327,11 +1494,22 @@ def queue_overview() -> dict[str, Any]:
             ).fetchall()
             if not queued:
                 continue
+            budget = t["budget_gpu_min"]
+            spent = spent_map.get(t["id"], 0)
             groups.append({
                 "tenant_id": t["id"],
                 "weight": round(t["weight"], 6),
                 "balance_gpu_min": round(t["deficit"], 6),
                 "max_gpus": t["max_gpus"],
+                "budget_gpu_min": budget,
+                "budget_used_gpu_min": spent,
+                "budget_remaining_gpu_min": (
+                    None if budget is None else max(budget - spent, 0)
+                ),
+                "budget_window_start_at": (
+                    now_dt - timedelta(hours=24)
+                ).isoformat(),
+                "budget_window_end_at": now_dt.isoformat(),
                 "running_gpus": t["running_gpus"],
                 "oldest_queued_at": queued[0]["queued_at"],
                 "jobs": [

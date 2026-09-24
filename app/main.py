@@ -59,6 +59,21 @@ class TenantIn(BaseModel):
         ),
         examples=[4],
     )
+    budget_gpu_min: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional rolling 24-hour GPU-minute budget: the tenant may be "
+            "dispatched at most this many gpus*duration_min of job cost in "
+            "the window (now-24h, now] ending at each batch's reference "
+            "instant. Provide a positive integer to set/update the budget; "
+            "send null explicitly to clear it (unlimited). Omit the field "
+            "entirely to leave an existing tenant's budget unchanged (new "
+            "tenants get unlimited). The field must be omitted, not null, "
+            "to preserve a budget."
+        ),
+        examples=[1440],
+    )
 
     @field_validator("max_gpus", mode="before")
     @classmethod
@@ -67,6 +82,16 @@ class TenantIn(BaseModel):
         # not be accepted as an integer GPU cap.
         if isinstance(value, bool):
             raise ValueError("max_gpus must be a positive integer or null")
+        return value
+
+    @field_validator("budget_gpu_min", mode="before")
+    @classmethod
+    def _reject_bool_for_budget(cls, value):
+        # JSON booleans must not be accepted as an integer GPU-minute budget.
+        if isinstance(value, bool):
+            raise ValueError(
+                "budget_gpu_min must be a positive integer or null"
+            )
         return value
 
 
@@ -161,13 +186,15 @@ class MaintenanceWindowIn(BaseModel):
 
 @app.post("/tenants", tags=["tenants"], status_code=201)
 def create_or_update_tenant(body: TenantIn):
-    # Distinguish "field omitted" (preserve existing cap) from an explicit
-    # JSON null (clear the cap).
+    # Distinguish "field omitted" (preserve existing value) from an explicit
+    # JSON null (clear it) for both the concurrent-GPU cap and the rolling
+    # 24h GPU-minute budget.
+    kwargs = {}
     if "max_gpus" in body.model_fields_set:
-        return scheduler.upsert_tenant(
-            body.tenant_id, body.weight, max_gpus=body.max_gpus
-        )
-    return scheduler.upsert_tenant(body.tenant_id, body.weight)
+        kwargs["max_gpus"] = body.max_gpus
+    if "budget_gpu_min" in body.model_fields_set:
+        kwargs["budget_gpu_min"] = body.budget_gpu_min
+    return scheduler.upsert_tenant(body.tenant_id, body.weight, **kwargs)
 
 
 @app.get("/tenants", tags=["tenants"])

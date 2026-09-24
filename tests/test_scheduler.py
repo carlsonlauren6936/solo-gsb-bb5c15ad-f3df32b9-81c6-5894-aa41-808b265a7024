@@ -762,14 +762,18 @@ def test_max_gpus_column_migrated_from_legacy_database(tmp_path, monkeypatch):
     db_mod.reset_for_tests()
     try:
         db_mod.connect(str(legacy))
-        # Existing tenant migrated with an unlimited cap and still works.
+        # Existing tenant migrated with an unlimited cap and budget and still
+        # works.
         old = scheduler.get_tenant("old")
         assert old["max_gpus"] is None
+        assert old["budget_gpu_min"] is None
+        assert old["budget_remaining_gpu_min"] is None
         r = scheduler.run_batch(now=at(5))
         assert r["selection_order"] == ["J000001"]
-        # New tenants can set caps on the migrated schema.
-        t = scheduler.upsert_tenant("new", 1.0, max_gpus=2)
+        # New tenants can set caps and budgets on the migrated schema.
+        t = scheduler.upsert_tenant("new", 1.0, max_gpus=2, budget_gpu_min=10)
         assert t["max_gpus"] == 2
+        assert t["budget_gpu_min"] == 10
     finally:
         db_mod.reset_for_tests()
         get_settings.cache_clear()

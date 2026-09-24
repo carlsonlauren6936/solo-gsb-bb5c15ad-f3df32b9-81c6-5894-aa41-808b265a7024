@@ -351,6 +351,73 @@ def main() -> int:
     assert len(scheduler.list_maintenance_windows()) == 3
     print("case 10 maintenance windows admission/preview OK")
 
+    # --- Case 11: rolling 24h GPU-minute budgets ---------------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    t = scheduler.upsert_tenant("a", 1.0, budget_gpu_min=100)
+    assert t["budget_gpu_min"] == 100 and t["budget_used_gpu_min"] == 0
+    assert t["budget_remaining_gpu_min"] == 100
+
+    # 30 x 3 = 90 admitted; a fourth 30 (120 > 100) waits.
+    for _ in range(4):
+        submit("a", 1, 30, 1.0, iso(0))
+    jb = submit("b", 2, 10, 1.0, iso(0))  # unlimited tenant, unaffected
+    r = scheduler.run_batch(now=at(5))
+    # a's J1 (round 1), b's J5 (round 1), then a's J2/J3 (rounds 2/3);
+    # a's J4 would take the rolling spend to 120 > 100 and stays queued.
+    assert r["selection_order"] == [
+        "J000001", "J000005", "J000002", "J000003"], r["selection_order"]
+    a = next(x for x in r["tenants"] if x["id"] == "a")
+    assert a["budget_used_gpu_min"] == 90
+    assert a["budget_remaining_gpu_min"] == 10
+    # Budget-blocked head earned no quantum; the other tenant dispatched.
+    blocked = scheduler.run_batch(now=at(6))
+    assert blocked["selection_order"] == []
+    assert all(
+        e["kind"] != "QUANTUM" for e in blocked["events"]
+        if e["tenant_id"] == "a"
+    )
+
+    # Completion does not refund the charge.
+    scheduler.complete_job("J000001")
+    rr = scheduler.run_batch(now=at(7))
+    assert rr["selection_order"] == []
+
+    # Clear the budget: the blocked head dispatches on the next batch.
+    assert scheduler.upsert_tenant(
+        "a", 1.0, budget_gpu_min=None)["budget_gpu_min"] is None
+    r2 = scheduler.run_batch(now=at(8))
+    assert r2["selection_order"] == ["J000004"], r2["selection_order"]
+
+    # Rolling window: a charge older than 24h drops out (left-open window).
+    db.reset_for_tests()
+    db.connect(":memory:")
+    scheduler.upsert_tenant("c", 1.0, budget_gpu_min=60)
+    old = submit("c", 1, 60, 1.0, iso(0))
+    scheduler.run_batch(now=at(10))
+    db.get_conn().execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?", (iso(10), old["id"]))
+    # One minute before the edge the old charge still blocks a fresh job.
+    fresh = submit("c", 1, 60, 1.0, iso(10 + 24 * 60 - 1))
+    rb = scheduler.run_batch(now=at(10 + 24 * 60 - 1))
+    assert rb["selection_order"] == [], rb["selection_order"]
+    # Exactly 24h later: (now-24h, now] no longer contains the old charge.
+    scheduler.cancel_job(fresh["id"])
+    edge = submit("c", 1, 60, 1.0, iso(10 + 24 * 60))
+    re = scheduler.run_batch(now=at(10 + 24 * 60))
+    assert re["selection_order"] == [edge["id"]], re["selection_order"]
+
+    # Preview shares the path and persists nothing.
+    db.reset_for_tests()
+    db.connect(":memory:")
+    scheduler.upsert_tenant("d", 1.0, budget_gpu_min=10)
+    submit("d", 1, 60, 1.0, iso(0))
+    p = scheduler.preview_batch(now=at(5))
+    assert p["preview"] is True and p["selection_order"] == []
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) AS n FROM batches").fetchone()["n"] == 0
+    print("case 11 rolling 24h GPU-minute budgets OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 
